@@ -1,1 +1,150 @@
+#Imports :
 import pandas as pd
+import numpy as np
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+
+from sklearn.metrics import (
+    classification_report,
+    roc_auc_score,
+    precision_recall_curve,
+    confusion_matrix
+)
+
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+import shap
+import joblib
+
+# load dataset:
+df = pd.read_csv("hospital_readmissions.csv")
+
+#Data quality & validation :
+def data_quality_report(df):
+    report = pd.DataFrame({
+        "missing_pct": df.isnull().mean(),
+        "unique_values": df.nunique()
+    })
+    return report
+
+dq_report = data_quality_report(df)
+print(dq_report)
+
+TARGET = "readmitted"
+
+#Target and features
+X = df.drop(columns=[TARGET, "patient_id"])
+y = df[TARGET]
+
+#Feature types :
+numeric_features = [
+    "age",
+    "num_prior_admissions",
+    "length_of_stay",
+    "num_procedures",
+    "num_medications",
+    "chronic_conditions_count"
+]
+
+categorical_features = [
+    "gender",
+    "discharge_type",
+    "insurance_type"
+]
+
+# Preprocessing pipeline :
+numeric_transformer = Pipeline(steps=[
+    ("scaler", StandardScaler())
+])
+
+categorical_transformer = Pipeline(steps=[
+    ("onehot", OneHotEncoder(handle_unknown="ignore"))
+])
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, numeric_features),
+        ("cat", categorical_transformer, categorical_features)
+    ]
+)
+# Train / test split :
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.2,
+    stratify=y,
+    random_state=42
+)
+# Model 1: Logistic Regression (interpretable baseline) :
+lr_pipeline = ImbPipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("smote", SMOTE(random_state=42)),
+    ("model", LogisticRegression(
+        max_iter=1000,
+        class_weight="balanced"
+    ))
+])
+
+lr_pipeline.fit(X_train, y_train)
+
+y_pred_lr = lr_pipeline.predict(X_test)
+y_prob_lr = lr_pipeline.predict_proba(X_test)[:, 1]
+
+print(classification_report(y_test, y_pred_lr))
+print("ROC AUC:", roc_auc_score(y_test, y_prob_lr))
+
+# Model 2: Random Forest (non-linear patterns) :
+rf_pipeline = ImbPipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("smote", SMOTE(random_state=42)),
+    ("model", RandomForestClassifier(
+        n_estimators=300,
+        max_depth=10,
+        min_samples_leaf=30,
+        random_state=42
+    ))
+])
+
+rf_pipeline.fit(X_train, y_train)
+
+y_pred_rf = rf_pipeline.predict(X_test)
+y_prob_rf = rf_pipeline.predict_proba(X_test)[:, 1]
+
+print(classification_report(y_test, y_pred_rf))
+print("ROC AUC:", roc_auc_score(y_test, y_prob_rf))
+
+#Threshold optimization :
+precision, recall, thresholds = precision_recall_curve(y_test, y_prob_rf)
+
+business_threshold = thresholds[np.argmax(recall - 0.5 * precision)]
+print("Optimized Threshold:", business_threshold)
+
+y_pred_opt = (y_prob_rf >= business_threshold).astype(int)
+print(confusion_matrix(y_test, y_pred_opt))
+
+ #Model explainability (SHAP) :
+explainer = shap.TreeExplainer(
+    rf_pipeline.named_steps["model"]
+)
+
+X_transformed = rf_pipeline.named_steps["preprocessor"].transform(X_test)
+
+shap_values = explainer.shap_values(X_transformed)
+
+shap.summary_plot(shap_values[1], X_transformed)
+
+ #Save model (deployment ready) :
+joblib.dump(rf_pipeline, "readmission_model.pkl")
+
+# Inference function :
+def predict_readmission(input_df):
+    model = joblib.load("readmission_model.pkl")
+    prob = model.predict_proba(input_df)[:, 1]
+    return prob
+
